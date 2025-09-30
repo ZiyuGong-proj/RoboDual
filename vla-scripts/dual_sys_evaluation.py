@@ -18,7 +18,19 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
     def __init__(self, model, processor, action_tokenizer):
         super().__init__()
 
-        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        inferred_model = getattr(model, "module", model)
+        try:
+            inferred_param = next(inferred_model.parameters())
+        except (AttributeError, StopIteration):
+            try:
+                inferred_param = next(model.parameters())
+            except (AttributeError, StopIteration):
+                inferred_param = None
+
+        if inferred_param is not None:
+            self.device = inferred_param.device
+        else:
+            self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         self.processor = processor
         self.dual_sys = model
         self.dual_impl = getattr(self.dual_sys, "module", self.dual_sys)
@@ -69,15 +81,15 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
 
         image = obs["rgb_obs"]['rgb_static']
         gripper_image = obs["rgb_obs"]['rgb_gripper']
-        gripper_image = self.processor.image_processor.apply_transform(Image.fromarray(gripper_image))[:3].unsqueeze(0).to(self.dual_sys.device)
+        gripper_image = self.processor.image_processor.apply_transform(Image.fromarray(gripper_image))[:3].unsqueeze(0).to(self.device)
 
         tactile_image = None
-        # tactile_image = torch.from_numpy(obs["rgb_obs"]['rgb_tactile']).permute(2,0,1).unsqueeze(0).to(self.dual_sys.device, dtype=torch.float) / 255
-        depth_image = torch.from_numpy(obs["depth_obs"]['depth_static']).unsqueeze(0).to(self.dual_sys.device) - self.depth_min / (self.depth_max - self.depth_min)
-        depth_gripper = torch.from_numpy(obs["depth_obs"]['depth_gripper']).unsqueeze(0).to(self.dual_sys.device) - self.gripper_depth_min / (self.gripper_depth_max - self.gripper_depth_min)
+        # tactile_image = torch.from_numpy(obs["rgb_obs"]['rgb_tactile']).permute(2,0,1).unsqueeze(0).to(self.device, dtype=torch.float) / 255
+        depth_image = torch.from_numpy(obs["depth_obs"]['depth_static']).unsqueeze(0).to(self.device) - self.depth_min / (self.depth_max - self.depth_min)
+        depth_gripper = torch.from_numpy(obs["depth_obs"]['depth_gripper']).unsqueeze(0).to(self.device) - self.gripper_depth_min / (self.gripper_depth_max - self.gripper_depth_min)
 
         prompt = get_openvla_prompt(instruction)
-        inputs = self.processor(prompt, Image.fromarray(image)).to(self.dual_sys.device, dtype=torch.bfloat16)
+        inputs = self.processor(prompt, Image.fromarray(image)).to(self.device, dtype=torch.bfloat16)
 
 
         if (step + 1) % 8 == 0 or step == 0: 
@@ -97,21 +109,21 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
         zero_actions[:, :num_cond_actions] = self.action[:, -num_cond_actions:]
         ref_actions = zero_actions.to(self.action.device)
 
-        state = torch.from_numpy(obs['robot_obs']).to(self.dual_sys.device, dtype=torch.float)
+        state = torch.from_numpy(obs['robot_obs']).to(self.device, dtype=torch.float)
         state = torch.cat([state[:6], state[[-1]]], dim=-1).unsqueeze(0)
 
         if step == 0:
             self.obs_buffer = image
 
-        prev_img = self.processor.image_processor.apply_transform(Image.fromarray(self.obs_buffer))[:3].unsqueeze(0).to(self.dual_sys.device)
+        prev_img = self.processor.image_processor.apply_transform(Image.fromarray(self.obs_buffer))[:3].unsqueeze(0).to(self.device)
         obs = (inputs["pixel_values"][:,:3].to(torch.float), prev_img)
 
 
-        hist_action = torch.zeros((1,4,7)).to(self.dual_sys.device)
+        hist_action = torch.zeros((1,4,7)).to(self.device)
         available_hist_acts = len(self.hist_action)
         available_hist_acts = 4 if available_hist_acts > 4 else available_hist_acts
         if available_hist_acts > 0:
-            hist_action[:, -available_hist_acts:] = torch.stack(self.hist_action[-available_hist_acts:], dim=0).unsqueeze(0).to(self.dual_sys.device)
+            hist_action[:, -available_hist_acts:] = torch.stack(self.hist_action[-available_hist_acts:], dim=0).unsqueeze(0).to(self.device)
 
 
         dp_action = self.dual_impl.ema_fast_system.ema_model.predict_action(
