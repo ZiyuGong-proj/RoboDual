@@ -21,6 +21,7 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         self.processor = processor
         self.dual_sys = model
+        self.dual_impl = getattr(self.dual_sys, "module", self.dual_sys)
         self.action_tokenizer = action_tokenizer
 
         self.temporal_size = 8
@@ -81,7 +82,7 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
 
         if (step + 1) % 8 == 0 or step == 0: 
             # Run VLA Inference
-            action, hidden_states = self.dual_sys.module.slow_system.predict_action(**inputs, do_sample=False)
+            action, hidden_states = self.dual_impl.slow_system.predict_action(**inputs, do_sample=False)
             action = torch.tensor(action).to(hidden_states.device).unsqueeze(0)
             action = rearrange(action, 'b (f d) -> b f d', f=8)
             self.action = action[:,:,:7]
@@ -113,7 +114,7 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
             hist_action[:, -available_hist_acts:] = torch.stack(self.hist_action[-available_hist_acts:], dim=0).unsqueeze(0).to(self.dual_sys.device)
 
 
-        dp_action = self.dual_sys.module.ema_fast_system.ema_model.predict_action(
+        dp_action = self.dual_impl.ema_fast_system.ema_model.predict_action(
                                                             ref_action = ref_actions.to(torch.float),
                                                             action_cond = self.hidden_states.to(torch.float),
                                                             obs = obs,
