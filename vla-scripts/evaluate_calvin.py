@@ -202,8 +202,13 @@ def rollout(env, model, task_oracle, subtask, val_annotations, debug, eval_dir, 
         }
 
     for step in range(ep_len):
+        cycle_start = time.perf_counter()
         action = model.step(obs, lang_annotation, step)
         obs, _, _, current_info = env.step(action)
+        cycle_end = time.perf_counter()
+
+        if hasattr(model, "record_control_cycle"):
+            model.record_control_cycle(cycle_end - cycle_start)
 
         if debug:
             img_dict['static'].append(copy.deepcopy(obs['rgb_obs']['rgb_static']))
@@ -292,7 +297,7 @@ def main(args):
     eva = DualSystemCalvinEvaluation(dual_sys, processor, action_tokenizer)
     dual_sys.eval()
     avg_reward = torch.tensor(evaluate_policy(
-        eva, 
+        eva,
         env,
         save_path+'success_rate.txt', 
         save_path+'result.txt', 
@@ -305,10 +310,38 @@ def main(args):
         debug = False,
     )).float().mean().to(device)
 
+    timing_tensors = {
+        name: stats.to_tensor(eva.device)
+        for name, stats in eva.timing_summaries().items()
+    }
+
     acc.wait_for_everyone()
-    avg_reward = acc.gather_for_metrics(avg_reward).mean() 
+    avg_reward = acc.gather_for_metrics(avg_reward).mean()
+    gathered_timing = {
+        name: acc.gather_for_metrics(tensor)
+        for name, tensor in timing_tensors.items()
+    }
     if acc.is_main_process:
         print('average success rate ', avg_reward)
+        for name, tensor in gathered_timing.items():
+            if tensor.ndim == 1:
+                tensor = tensor.unsqueeze(0)
+            total_count = tensor[:, 0].sum().item()
+            total_duration = tensor[:, 1].sum().item()
+            total_sq = tensor[:, 2].sum().item()
+
+            if total_count > 0 and total_duration > 0:
+                mean_duration = total_duration / total_count
+                variance = max(total_sq / total_count - mean_duration * mean_duration, 0.0)
+                std_duration = variance ** 0.5
+                frequency = 1.0 / mean_duration if mean_duration > 0 else 0.0
+                print(
+                    f"{name.capitalize()} frequency: {frequency:.2f} Hz ("
+                    f"mean {mean_duration * 1000:.2f} ms, std {std_duration * 1000:.2f} ms, "
+                    f"n={int(total_count)})"
+                )
+            else:
+                print(f"{name.capitalize()} frequency: insufficient data")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

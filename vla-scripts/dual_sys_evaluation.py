@@ -1,13 +1,57 @@
-import torch
-import torchvision.transforms as T
-import torch.nn.functional as F
-import numpy as np
-from PIL import Image
-from einops import rearrange
+import math
 import time
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+from einops import rearrange
+from PIL import Image
 
 from calvin_agent.models.calvin_base_model import CalvinBaseModel
 
+
+@dataclass
+class TimingAggregator:
+    """Keeps running statistics for latency measurements."""
+
+    count: int = 0
+    total: float = 0.0
+    total_sq: float = 0.0
+
+    def update(self, duration: float) -> None:
+        self.count += 1
+        self.total += duration
+        self.total_sq += duration * duration
+
+    def to_tensor(self, device: torch.device) -> torch.Tensor:
+        return torch.tensor(
+            [float(self.count), float(self.total), float(self.total_sq)],
+            device=device,
+            dtype=torch.float64,
+        )
+
+    def merge(self, other: "TimingAggregator") -> None:
+        self.count += other.count
+        self.total += other.total
+        self.total_sq += other.total_sq
+
+    def mean(self) -> float:
+        if self.count == 0:
+            return 0.0
+        return self.total / self.count
+
+    def std(self) -> float:
+        if self.count == 0:
+            return 0.0
+        mean = self.mean()
+        variance = max(self.total_sq / self.count - mean * mean, 0.0)
+        return math.sqrt(variance)
+
+    def frequency(self) -> float:
+        mean = self.mean()
+        if mean == 0.0:
+            return 0.0
+        return 1.0 / mean
 
 
 def get_openvla_prompt(instruction: str, tokenized_action: str = None) -> str:
@@ -58,6 +102,10 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
 
         self.hist_action = []
 
+        self._generalist_stats = TimingAggregator()
+        self._specialist_stats = TimingAggregator()
+        self._control_stats = TimingAggregator()
+
         
     def reset(self,):
         """
@@ -92,9 +140,11 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
         inputs = self.processor(prompt, Image.fromarray(image)).to(self.device, dtype=torch.bfloat16)
 
 
-        if (step + 1) % 8 == 0 or step == 0: 
+        if (step + 1) % 8 == 0 or step == 0:
             # Run VLA Inference
+            generalist_start = time.perf_counter()
             action, hidden_states = self.dual_impl.slow_system.predict_action(**inputs, do_sample=False)
+            self._generalist_stats.update(time.perf_counter() - generalist_start)
             action = torch.tensor(action).to(hidden_states.device).unsqueeze(0)
             action = rearrange(action, 'b (f d) -> b f d', f=8)
             self.action = action[:,:,:7]
@@ -126,6 +176,7 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
             hist_action[:, -available_hist_acts:] = torch.stack(self.hist_action[-available_hist_acts:], dim=0).unsqueeze(0).to(self.device)
 
 
+        specialist_start = time.perf_counter()
         dp_action = self.dual_impl.ema_fast_system.ema_model.predict_action(
                                                             ref_action = ref_actions.to(torch.float),
                                                             action_cond = self.hidden_states.to(torch.float),
@@ -137,6 +188,7 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
                                                             proprio = state,
                                                             hist_action=hist_action,
                                                             )
+        self._specialist_stats.update(time.perf_counter() - specialist_start)
         self.obs_buffer = image
         action = np.array(dp_action.tolist())
 
@@ -164,3 +216,13 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
         self.hist_action.append(torch.from_numpy(action_prediction))
 
         return action_prediction
+
+    def record_control_cycle(self, duration: float) -> None:
+        self._control_stats.update(duration)
+
+    def timing_summaries(self) -> dict:
+        return {
+            "generalist": self._generalist_stats,
+            "specialist": self._specialist_stats,
+            "control": self._control_stats,
+        }
